@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <!-- 19041 目标框架以便直接使用 Windows 内置 WinRT OCR（Windows.Media.Ocr） -->
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <!-- 用于系统托盘图标 NotifyIcon -->
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>ReadNow</AssemblyName>
+    <RootNamespace>ReadNow</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\readnow.ico</ApplicationIcon>
+    <Version>0.2.0</Version>
+    <Description>ReadNow - 划词朗读 / 截图朗读 / 翻译</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 托盘图标资源 -->
+    <EmbeddedResource Include="Assets\readnow.ico" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,31 @@
+<Window x:Class="ReadNow.Views.SnipOverlayWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        Topmost="True" ShowInTaskbar="False" Cursor="Cross"
+        ResizeMode="NoResize" ShowActivated="True">
+    <Grid x:Name="RootGrid">
+        <!-- 冻结的全屏画面 -->
+        <Image x:Name="FrozenImage" Stretch="Fill"/>
+        <!-- 全局压暗层 -->
+        <Rectangle Fill="#66000000"/>
+        <!-- 框选交互层 -->
+        <Canvas x:Name="RootCanvas" Background="Transparent"
+                MouseLeftButtonDown="Canvas_MouseLeftButtonDown"
+                MouseMove="Canvas_MouseMove"
+                MouseLeftButtonUp="Canvas_MouseLeftButtonUp">
+            <Border x:Name="SelectionRect" Visibility="Collapsed"
+                    BorderBrush="#2563EB" BorderThickness="2">
+                <!-- 选中区域显示未压暗的画面 -->
+                <Border.Background>
+                    <VisualBrush x:Name="SelectionBrush" Stretch="Fill"/>
+                </Border.Background>
+            </Border>
+        </Canvas>
+        <Border HorizontalAlignment="Center" VerticalAlignment="Top" Margin="0,40,0,0"
+                Background="#CC1F2937" CornerRadius="8" Padding="14,7">
+            <TextBlock Text="按住鼠标左键框选要朗读的区域，Esc 取消"
+                       Foreground="White" FontSize="13"/>
+        </Border>
+    </Grid>
+</Window>

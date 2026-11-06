@@ -1,0 +1,8 @@
+<Window x:Class="ReadNow.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="ReadNow" Width="0" Height="0"
+        WindowStyle="None" ShowInTaskbar="False" Opacity="0"
+        AllowsTransparency="True" Background="Transparent"
+        Left="-32000" Top="-32000">
+</Window>
