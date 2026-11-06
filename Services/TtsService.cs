@@ -26,9 +26,11 @@ public sealed class TtsService : IDisposable
 
     private List<string> _sentences = new();
     private string? _lastText;
-    private int _bookmarkSentence;   // 停止时记住的句索引
+    private int _bookmarkSentence;   // 停止时记住的句索引（兜底用）
     private int _currentSentence;
     private bool _speaking;
+    private bool _paused;            // 精确暂停状态：音频停在原位置
+    private bool _playerOpen;        // 播放器里是否已加载音频
     private double _speed = 1.0;
     private VoiceInformation? _activeVoice;
 
@@ -40,6 +42,8 @@ public sealed class TtsService : IDisposable
     public string? SelectedVoiceId { get; set; }
 
     public bool IsSpeaking => _speaking;
+    /// <summary>精确暂停中：音频停在原位置，Resume 可一词不差地继续。</summary>
+    public bool IsPaused => _paused;
     /// <summary>本次播放起点句索引（>0 表示续播），供 UI 提示。</summary>
     public int LastStartOffset { get; private set; }
     public bool HasBookmark => _bookmarkSentence > 0;
@@ -92,11 +96,103 @@ public sealed class TtsService : IDisposable
         _ = PlayLoopAsync(start, _cts.Token);
     }
 
+    /// <summary>
+    /// 朗读中变速：按播放进度估算当前读到的位置，从该处用新速度重新合成继续，
+    /// 而不是跳回句首。估算失败时退化为从当前句开头重读。
+    /// </summary>
+    public void ChangeSpeedLive(double speed)
+    {
+        _speed = Math.Clamp(speed, MinSpeed, MaxSpeed);
+        if (!_speaking || _sentences.Count == 0) return;
+
+        // 估算当前句内的进度（0~1）
+        double frac = -1;
+        try
+        {
+            var dur = _player.NaturalDuration;
+            if (_playerOpen && dur.HasTimeSpan && dur.TimeSpan.TotalMilliseconds > 0)
+                frac = _player.Position.TotalMilliseconds / dur.TimeSpan.TotalMilliseconds;
+        }
+        catch { }
+
+        if (frac > 0.03 && frac < 0.97 && _currentSentence < _sentences.Count)
+        {
+            string sentence = _sentences[_currentSentence];
+            int cut = (int)(frac * sentence.Length);
+            cut = SnapToPausePoint(sentence, cut);
+            if (cut > 0 && cut < sentence.Length)
+                _sentences[_currentSentence] = sentence[cut..];
+        }
+
+        CancelPlayback();
+        _cts = new CancellationTokenSource();
+        _speaking = true;
+        _ = PlayLoopAsync(_currentSentence, _cts.Token);
+    }
+
+    /// <summary>把估算的切割点回退到最近的标点/空格后（最多回退 12 字），避免从半个词中间读。</summary>
+    private static int SnapToPausePoint(string sentence, int cut)
+    {
+        for (int i = cut; i > Math.Max(0, cut - 12); i--)
+        {
+            char c = sentence[i - 1];
+            if (c is ' ' or '，' or ',' or '、' or '。' or '；' or ';' or '：' or ':' or '！' or '？' or '!' or '?')
+                return i;
+        }
+        return cut;
+    }
+
+    /// <summary>精确暂停：音频停在原位置，Resume() 从同一位置继续。</summary>
+    public void Pause()
+    {
+        if (!_speaking) return;
+        _bookmarkSentence = _currentSentence; // 兜底书签照记
+        _paused = _playerOpen; // 只有播放器里已加载音频才有"精确暂停"可言
+        _cts?.Cancel();
+        _cts = null;
+        _speaking = false;
+        if (_paused)
+        {
+            try { if (_player.CanPause) _player.Pause(); } catch { }
+        }
+        SpeakEnded?.Invoke();
+    }
+
+    /// <summary>从精确暂停处继续（一词不差）。</summary>
+    public void Resume(double speed)
+    {
+        if (!_paused) return;
+        _paused = false;
+        _speaking = true;
+        _speed = Math.Clamp(speed, MinSpeed, MaxSpeed);
+        _cts = new CancellationTokenSource();
+        var ct = _cts.Token;
+
+        // 当前句播完后，从下一句接着走
+        EventHandler? onEnded = null;
+        onEnded = (s, e) =>
+        {
+            _player.MediaEnded -= onEnded;
+            _playerOpen = false;
+            if (!ct.IsCancellationRequested)
+                _ = PlayLoopAsync(_currentSentence + 1, ct);
+        };
+        _player.MediaEnded += onEnded;
+        try { _player.Play(); }
+        catch (Exception ex)
+        {
+            App.LogError(ex);
+            // 恢复失败就退化为从当前句重读
+            Speak(_lastText ?? "", speed);
+        }
+    }
+
     /// <summary>停止朗读。remember=true 时记住句位置（默认），下次同文本续播。</summary>
     public void Stop(bool remember = true)
     {
         if (_speaking && remember)
             _bookmarkSentence = _currentSentence;
+        _paused = false;
         CancelPlayback();
         SpeakEnded?.Invoke();
     }
@@ -113,7 +209,9 @@ public sealed class TtsService : IDisposable
     {
         _cts?.Cancel();
         _cts = null;
+        _paused = false;
         try { _player.Close(); } catch { } // Close 释放文件句柄
+        _playerOpen = false;
         _speaking = false;
     }
 
@@ -137,13 +235,19 @@ public sealed class TtsService : IDisposable
                 {
                     await using var reg = ct.Register(() => tcs.TrySetCanceled());
                     _player.Open(new Uri(file));
+                    _playerOpen = true;
                     _player.Play();
                     await tcs.Task;
                 }
                 finally
                 {
                     _player.MediaEnded -= onEnded;
-                    _player.Close(); // Close 才会释放音频文件句柄，Stop 不会
+                    // 暂停时不释放：Resume 还要从原位置继续；其余情况 Close 释放文件句柄
+                    if (!_paused)
+                    {
+                        _player.Close();
+                        _playerOpen = false;
+                    }
                 }
             }
 

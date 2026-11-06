@@ -114,6 +114,20 @@
                         ToolTip="关闭 (Esc)"
                         Background="Transparent" Foreground="#9CA3AF" BorderThickness="0"/>
             </WrapPanel>
+
+            <!-- 功能开关：与托盘菜单双向同步，自动记忆 -->
+            <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+                <CheckBox x:Name="SelectionToggle" Content="划词朗读（含 Ctrl+A）"
+                          FontSize="14" VerticalAlignment="Center" Margin="0,0,18,0"
+                          Cursor="Hand" Checked="Toggle_Changed" Unchecked="Toggle_Changed"/>
+                <CheckBox x:Name="ScreenshotToggle" Content="截图识别（Alt+Q / 自动）"
+                          FontSize="14" VerticalAlignment="Center" Margin="0,0,18,0"
+                          Cursor="Hand" Checked="Toggle_Changed" Unchecked="Toggle_Changed"/>
+                <CheckBox x:Name="StartupToggle" Content="开机自动启动"
+                          FontSize="14" VerticalAlignment="Center"
+                          Cursor="Hand" ToolTip="登录 Windows 后自动在后台运行 ReadNow"
+                          Checked="StartupToggle_Changed" Unchecked="StartupToggle_Changed"/>
+            </StackPanel>
         </StackPanel>
     </Border>
 </Window>

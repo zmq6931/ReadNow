@@ -45,6 +45,10 @@ public partial class PopupWindow : Window
         _tts.SpeakEnded += OnSpeakEnded;
         _tts.SentenceProgress += OnSentenceProgress;
 
+        // 功能开关复选框：与托盘菜单双向同步
+        SyncTogglesFromHost();
+        HostWindow.TogglesChanged += OnHostTogglesChanged;
+
         KeyDown += (_, e) =>
         {
             if (e.Key == Key.Escape) CloseAndStop();
@@ -53,7 +57,55 @@ public partial class PopupWindow : Window
         {
             _tts.SpeakEnded -= OnSpeakEnded;
             _tts.SentenceProgress -= OnSentenceProgress;
+            HostWindow.TogglesChanged -= OnHostTogglesChanged;
         };
+    }
+
+    private static MainWindow HostWindow => (MainWindow)System.Windows.Application.Current.MainWindow;
+    private bool _updatingToggles;
+
+    private void Toggle_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_updatingToggles) return;
+        // 只更新被点击的那个开关：若两个都写，第一个写入触发的同步事件会把
+        // 第二个复选框刷回旧值，导致它永远改不动（截图开关点不掉的 bug）
+        if (ReferenceEquals(sender, SelectionToggle))
+            HostWindow.SelectionWatchEnabled = SelectionToggle.IsChecked == true;
+        else
+            HostWindow.ScreenshotWatchEnabled = ScreenshotToggle.IsChecked == true;
+    }
+
+    private void OnHostTogglesChanged()
+    {
+        if (!Dispatcher.CheckAccess()) { Dispatcher.Invoke(OnHostTogglesChanged); return; }
+        SyncTogglesFromHost();
+    }
+
+    private void SyncTogglesFromHost()
+    {
+        _updatingToggles = true;
+        SelectionToggle.IsChecked = HostWindow.SelectionWatchEnabled;
+        ScreenshotToggle.IsChecked = HostWindow.ScreenshotWatchEnabled;
+        StartupToggle.IsChecked = StartupService.IsEnabled();
+        _updatingToggles = false;
+    }
+
+    private void StartupToggle_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_updatingToggles) return;
+        try
+        {
+            StartupService.SetEnabled(StartupToggle.IsChecked == true);
+            ShowStatus(StartupToggle.IsChecked == true ? "已开启开机自动启动 ✓" : "已关闭开机自动启动 ✓");
+            var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
+            timer.Tick += (_, _) => { timer.Stop(); HideStatus(); };
+            timer.Start();
+        }
+        catch (Exception ex)
+        {
+            App.LogError(ex);
+            ShowStatus("设置开机启动失败");
+        }
     }
 
     /// <summary>用新内容刷新弹窗（单例模式下复用同一窗口）。</summary>
@@ -63,19 +115,20 @@ public partial class PopupWindow : Window
         PreviewText.Text = text;
         TranslationPanel.Visibility = Visibility.Collapsed;
         HideStatus();
-        if (_tts.IsSpeaking) _tts.Stop(); // 新内容来了，停掉旧朗读
+        if (_tts.IsSpeaking || _tts.IsPaused) _tts.Stop(); // 新内容来了，彻底停掉旧的
     }
 
-    /// <summary>弹出并放到光标附近。</summary>
+    /// <summary>弹出并放到光标附近，焦点落在"朗读"按钮上（空格/回车即播放）。</summary>
     public void ShowNearCursor(Native.Win32.POINT screenPixelPos)
     {
         Show();
         UpdateLayout(); // 强制布局，拿到真实尺寸后再校正边缘
         MoveNearCursor(screenPixelPos);
         Activate();
+        SpeakButton.Focus();
     }
 
-    /// <summary>移动（已显示的）窗口到光标附近，保证不超出屏幕工作区。</summary>
+    /// <summary>移动（已显示的）窗口到光标附近，保证不超出屏幕工作区，并重置焦点到朗读按钮。</summary>
     public void MoveNearCursor(Native.Win32.POINT screenPixelPos)
     {
         double pdi = 1.0;
@@ -90,6 +143,8 @@ public partial class PopupWindow : Window
         if (Top + ActualHeight > workArea.Bottom) Top = workArea.Bottom - ActualHeight - 8;
         if (Left < workArea.Left) Left = workArea.Left + 8;
         if (Top < workArea.Top) Top = workArea.Top + 8;
+
+        SpeakButton.Focus();
     }
 
     /// <summary>按住窗口空白处拖动。</summary>
@@ -105,14 +160,23 @@ public partial class PopupWindow : Window
     {
         if (_tts.IsSpeaking)
         {
-            _tts.Stop();
+            _tts.Pause(); // 精确暂停：音频停在原位置
+            return;
+        }
+        if (_tts.IsPaused)
+        {
+            _tts.Resume(AppSettings.Speed); // 从暂停处一词不差地继续
+            SetSpeakingUi(true);
             return;
         }
         _tts.Speak(_text, AppSettings.Speed);
         SetSpeakingUi(true);
     }
 
-    private void StopButton_Click(object sender, RoutedEventArgs e) => _tts.Stop();
+    private void StopButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_tts.IsSpeaking) _tts.Pause(); // 停止 = 精确暂停
+    }
 
     private void RestartButton_Click(object sender, RoutedEventArgs e)
     {
@@ -132,9 +196,9 @@ public partial class PopupWindow : Window
     {
         AppSettings.Speed = Math.Round(SpeedSlider.Value, 2);
         AppSettings.Save();
-        // 正在朗读时用新速度从当前句续读
+        // 正在朗读时用新速度从当前位置原地续读（按播放进度估算，不回句首）
         if (_tts.IsSpeaking)
-            _tts.Speak(_text, AppSettings.Speed);
+            _tts.ChangeSpeedLive(AppSettings.Speed);
     }
 
     private static string FormatSpeed(double v) => $"{v:0.##}x";
@@ -201,7 +265,7 @@ public partial class PopupWindow : Window
 
     private void SetSpeakingUi(bool speaking)
     {
-        SpeakButton.Content = speaking ? "⏸ 停止" : "▶ 朗读";
+        SpeakButton.Content = speaking ? "⏸ 暂停" : "▶ 朗读";
         if (speaking)
         {
             var resume = _tts.LastStartOffset > 0 ? "从上次位置继续 · " : "";

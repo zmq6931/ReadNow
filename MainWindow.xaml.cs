@@ -29,13 +29,33 @@ public partial class MainWindow : Window
     // 内置截图是否正在框选
     private bool _snipActive;
 
+    /// <summary>开关状态变化（弹窗复选框、托盘菜单据此双向同步）。</summary>
+    public event Action? TogglesChanged;
+
+    /// <summary>划词朗读开关：写入 AppSettings 记忆并立即生效。</summary>
     public bool SelectionWatchEnabled
     {
-        get => _watcher?.Enabled ?? false;
-        set { if (_watcher != null) _watcher.Enabled = value; }
+        get => AppSettings.SelectionEnabled;
+        set
+        {
+            AppSettings.SelectionEnabled = value;
+            AppSettings.Save();
+            if (_watcher != null) _watcher.Enabled = value;
+            TogglesChanged?.Invoke();
+        }
     }
 
-    public bool ScreenshotWatchEnabled { get; set; } = true;
+    /// <summary>截图识别开关：写入 AppSettings 记忆并立即生效。</summary>
+    public bool ScreenshotWatchEnabled
+    {
+        get => AppSettings.ScreenshotEnabled;
+        set
+        {
+            AppSettings.ScreenshotEnabled = value;
+            AppSettings.Save();
+            TogglesChanged?.Invoke();
+        }
+    }
 
     public MainWindow()
     {
@@ -58,8 +78,8 @@ public partial class MainWindow : Window
         // 监听剪贴板：截图工具（Win+Shift+S、微信 Alt+A 等）放图片进来时自动识别
         Win32.AddClipboardFormatListener(_source.Handle);
 
-        // 划词监听
-        _watcher = new SelectionWatcher();
+        // 划词监听（初始状态读取用户记忆）
+        _watcher = new SelectionWatcher { Enabled = AppSettings.SelectionEnabled };
         _watcher.TextCaptured += OnTextCaptured;
         _watcher.Start();
     }

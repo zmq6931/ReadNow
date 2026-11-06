@@ -19,6 +19,12 @@ public static class AppSettings
     /// <summary>用户选定的朗读声音 Id；空为自动（按语言优先女声）。</summary>
     public static string VoiceId { get; set; } = "";
 
+    /// <summary>划词朗读开关（划选 / Ctrl+A）。</summary>
+    public static bool SelectionEnabled { get; set; } = true;
+
+    /// <summary>截图识别开关（自动检测 + Alt+Q）。</summary>
+    public static bool ScreenshotEnabled { get; set; } = true;
+
     static AppSettings() => Load();
 
     private static void Load()
@@ -31,6 +37,9 @@ public static class AppSettings
             if (data == null) return;
             if (data.Speed is >= 0.5 and <= 4.0) Speed = data.Speed;
             VoiceId = data.VoiceId ?? "";
+            // 旧版 settings.json 没有这两个字段，null 时保持默认 true
+            SelectionEnabled = data.SelectionEnabled ?? true;
+            ScreenshotEnabled = data.ScreenshotEnabled ?? true;
         }
         catch { /* 设置损坏时用默认值 */ }
     }
@@ -40,7 +49,13 @@ public static class AppSettings
         try
         {
             Directory.CreateDirectory(Dir);
-            var json = JsonSerializer.Serialize(new SettingsData { Speed = Speed, VoiceId = VoiceId });
+            var json = JsonSerializer.Serialize(new SettingsData
+            {
+                Speed = Speed,
+                VoiceId = VoiceId,
+                SelectionEnabled = SelectionEnabled,
+                ScreenshotEnabled = ScreenshotEnabled
+            });
             File.WriteAllText(FilePath, json);
         }
         catch { /* 保存失败不影响使用 */ }
@@ -50,5 +65,7 @@ public static class AppSettings
     {
         public double Speed { get; set; } = 1.0;
         public string? VoiceId { get; set; }
+        public bool? SelectionEnabled { get; set; }
+        public bool? ScreenshotEnabled { get; set; }
     }
 }

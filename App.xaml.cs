@@ -102,6 +102,13 @@ public partial class App : System.Windows.Application
         menu.Items.Add(new Forms.ToolStripSeparator());
         menu.Items.Add(exitItem);
 
+        // 每次打开菜单时同步勾选状态（与弹窗内复选框保持一致）
+        menu.Opening += (_, _) =>
+        {
+            selectionItem.Checked = host.SelectionWatchEnabled;
+            screenshotItem.Checked = host.ScreenshotWatchEnabled;
+        };
+
         _trayIcon = new Forms.NotifyIcon
         {
             Text = "ReadNow - 划词/截图朗读",
