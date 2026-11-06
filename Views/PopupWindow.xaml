@@ -78,6 +78,16 @@
                            VerticalAlignment="Center" Margin="0,0,10,0"
                            FontSize="15" Foreground="#374151"/>
 
+                <Button Content="📋 复制" Click="CopyButton_Click"
+                        Padding="14,9" Margin="0,0,8,0" Cursor="Hand" FontSize="15"
+                        ToolTip="复制全部文字到剪贴板"
+                        Background="#E5E7EB" Foreground="#374151" BorderThickness="0">
+                    <Button.Resources>
+                        <Style TargetType="Border">
+                            <Setter Property="CornerRadius" Value="8"/>
+                        </Style>
+                    </Button.Resources>
+                </Button>
                 <Button Content="译英" Click="TranslateToEnglish_Click"
                         Padding="14,9" Margin="0,0,8,0" Cursor="Hand" FontSize="15"
                         ToolTip="翻译成英文"

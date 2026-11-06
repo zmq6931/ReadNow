@@ -142,6 +142,23 @@ public partial class PopupWindow : Window
     private async void TranslateToEnglish_Click(object sender, RoutedEventArgs e)
         => await TranslateAsync("en", "英文");
 
+    private void CopyButton_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            System.Windows.Clipboard.SetText(_text);
+            ShowStatus("已复制全部文字 ✓");
+            // 2 秒后清掉提示
+            var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
+            timer.Tick += (_, _) => { timer.Stop(); HideStatus(); };
+            timer.Start();
+        }
+        catch
+        {
+            ShowStatus("复制失败，剪贴板被占用，请再试一次");
+        }
+    }
+
     private async void TranslateToChinese_Click(object sender, RoutedEventArgs e)
         => await TranslateAsync("zh-CN", "中文");
 
