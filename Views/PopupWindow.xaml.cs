@@ -118,14 +118,46 @@ public partial class PopupWindow : Window
         if (_tts.IsSpeaking || _tts.IsPaused) _tts.Stop(); // 新内容来了，彻底停掉旧的
     }
 
-    /// <summary>弹出并放到光标附近，焦点落在"朗读"按钮上（空格/回车即播放）。</summary>
+    /// <summary>弹出并放到光标附近，强制拿到前台焦点（空格/回车即播放）。</summary>
     public void ShowNearCursor(Native.Win32.POINT screenPixelPos)
     {
         Show();
         UpdateLayout(); // 强制布局，拿到真实尺寸后再校正边缘
         MoveNearCursor(screenPixelPos);
+        ForceActivateAndFocus();
+    }
+
+    /// <summary>
+    /// 强制激活窗口并把键盘焦点给"朗读"按钮。
+    /// 划词/Ctrl+A 时用户正在用别的软件，普通 Activate() 会被 Windows 防抢占机制拦下，
+    /// 需要用 AttachThreadInput 借道前台线程。
+    /// </summary>
+    public void ForceActivateAndFocus()
+    {
+        try
+        {
+            var hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+            var foreground = Native.Win32.GetForegroundWindow();
+            uint fgThread = Native.Win32.GetWindowThreadProcessId(foreground, out _);
+            uint ourThread = Native.Win32.GetCurrentThreadId();
+            if (fgThread != ourThread)
+                Native.Win32.AttachThreadInput(ourThread, fgThread, true);
+            try
+            {
+                Native.Win32.SetForegroundWindow(hwnd);
+                Native.Win32.BringWindowToTop(hwnd);
+            }
+            finally
+            {
+                if (fgThread != ourThread)
+                    Native.Win32.AttachThreadInput(ourThread, fgThread, false);
+            }
+        }
+        catch { /* 拿不到焦点也不影响功能 */ }
+
         Activate();
         SpeakButton.Focus();
+        Keyboard.Focus(SpeakButton);
     }
 
     /// <summary>移动（已显示的）窗口到光标附近，保证不超出屏幕工作区，并重置焦点到朗读按钮。</summary>
@@ -199,6 +231,10 @@ public partial class PopupWindow : Window
         // 正在朗读时用新速度从当前位置原地续读（按播放进度估算，不回句首）
         if (_tts.IsSpeaking)
             _tts.ChangeSpeedLive(AppSettings.Speed);
+
+        // 拖完滑块焦点回到"朗读"按钮，空格/回车即可暂停或继续
+        SpeakButton.Focus();
+        Keyboard.Focus(SpeakButton);
     }
 
     private static string FormatSpeed(double v) => $"{v:0.##}x";

@@ -198,7 +198,7 @@ public partial class MainWindow : Window
         {
             _popup.UpdateText(text);
             _popup.MoveNearCursor(nearPos);
-            if (!_popup.IsActive) _popup.Activate();
+            _popup.ForceActivateAndFocus();
             return;
         }
 
