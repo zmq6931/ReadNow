@@ -28,6 +28,8 @@ public partial class MainWindow : Window
     private uint _lastImageSeq;
     // 内置截图是否正在框选
     private bool _snipActive;
+    // 最后一次弹窗的文本，供托盘"显示界面"恢复
+    private string _lastText = "";
 
     /// <summary>开关状态变化（弹窗复选框、托盘菜单据此双向同步）。</summary>
     public event Action? TogglesChanged;
@@ -191,9 +193,26 @@ public partial class MainWindow : Window
         ShowPopup("这是一个 ReadNow 测试弹窗。Hello, this is a test of the popup window.", pos);
     }
 
+    /// <summary>
+    /// 托盘菜单"显示界面"/双击图标：重新弹出主界面。
+    /// 即使划词和截图开关都关了、或按 Esc 关掉了弹窗，也能从这里找回设置界面。
+    /// </summary>
+    public void ShowMainInterface()
+    {
+        Dispatcher.Invoke(() =>
+        {
+            Win32.GetCursorPos(out var pos);
+            var text = string.IsNullOrWhiteSpace(_lastText)
+                ? "ReadNow 已就绪：划选文字或按 Alt+Q 截图，即可弹出朗读界面。"
+                : _lastText;
+            ShowPopup(text, pos);
+        });
+    }
+
     /// <summary>单例弹窗：已存在则刷新内容并移到光标处，不存在才新建。</summary>
     private void ShowPopup(string text, Win32.POINT nearPos)
     {
+        _lastText = text;
         if (_popup != null)
         {
             _popup.UpdateText(text);

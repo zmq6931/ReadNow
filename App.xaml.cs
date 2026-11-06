@@ -75,6 +75,9 @@ public partial class App : System.Windows.Application
     {
         var menu = new Forms.ContextMenuStrip();
 
+        // 显示界面：Esc 关掉弹窗、或划词/截图都关闭时，从这里找回主界面
+        var showItem = new Forms.ToolStripMenuItem("显示界面", null, (_, _) => host.ShowMainInterface());
+
         var selectionItem = new Forms.ToolStripMenuItem("划词朗读") { Checked = true, CheckOnClick = true };
         selectionItem.Click += (_, _) =>
         {
@@ -95,6 +98,8 @@ public partial class App : System.Windows.Application
 
         var exitItem = new Forms.ToolStripMenuItem("退出", null, (_, _) => Shutdown());
 
+        menu.Items.Add(showItem);
+        menu.Items.Add(new Forms.ToolStripSeparator());
         menu.Items.Add(selectionItem);
         menu.Items.Add(screenshotItem);
         menu.Items.Add(new Forms.ToolStripSeparator());
@@ -117,9 +122,7 @@ public partial class App : System.Windows.Application
             ContextMenuStrip = menu
         };
 
-        _trayIcon.DoubleClick += (_, _) =>
-            Balloon("ReadNow",
-                "正在运行中：划词弹出朗读窗；Ctrl+Alt+Q 区域截图朗读。");
+        _trayIcon.DoubleClick += (_, _) => host.ShowMainInterface();
     }
 
     /// <summary>从嵌入资源加载专属喇叭图标。</summary>
