@@ -67,7 +67,9 @@ public partial class PopupWindow : Window
         {
             _tts.SpeakEnded -= OnSpeakEnded;
             _tts.SentenceProgress -= OnSentenceProgress;
-            HostWindow.TogglesChanged -= OnHostTogglesChanged;
+            // 程序退出瞬间 MainWindow 可能已销毁，判空防止关窗时报空引用
+            if (System.Windows.Application.Current?.MainWindow is MainWindow mw)
+                mw.TogglesChanged -= OnHostTogglesChanged;
         };
     }
 

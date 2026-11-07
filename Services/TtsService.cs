@@ -9,7 +9,8 @@ namespace ReadNow.Services;
 
 /// <summary>
 /// 朗读服务 v5：Edge 在线神经语音（晓曼/晓晓，需联网）+ 本地自然语音包 + 离线兜底。
-/// - 弹窗出现时即预合成：当前声音前两句 + 另一个声音第一句，切声音零等待
+/// - 弹窗出现时即预合成：当前声音前三句 + 另一个声音前三句，切声音零等待
+/// - 朗读中备选声音同步预取当前句和后两句，中途切声音也近乎零等待
 /// - 倍速用播放器变速（音调校正），拖滑块零延迟、不回句首
 /// - 播放中后台预取下一句，句间无等待
 /// - 精确暂停：音频停在原位置，一词不差地继续
@@ -78,7 +79,7 @@ public sealed class TtsService : IDisposable
     }
 
     /// <summary>
-    /// 弹窗展示文本时调用：预先合成当前声音的前两句 + 另一个声音的第一句。
+    /// 弹窗展示文本时调用：预先合成当前声音的前三句 + 另一个声音的前三句。
     /// 用户点播放 / 切声音时直接用现成的，近乎零等待。
     /// </summary>
     public void PrepareText(string text)
@@ -117,6 +118,7 @@ public sealed class TtsService : IDisposable
                 if (_preparedText != text) return; // 文本已换新，别污染新的预合成
                 Prepare(alt.Id, 0);
                 Prepare(alt.Id, 1);
+                Prepare(alt.Id, 2);
             });
         }
     }
@@ -144,11 +146,23 @@ public sealed class TtsService : IDisposable
         }
         else
         {
-            // 同一文本：正在播 → 从当前位置继续（用于换声）；停了 → 从书签续播
+            // 同一文本：正在播 → 换声：记住当前句的播放进度比例，新声音从同一位置接着播
+            // （不切句子，这样预合成的备选声音整句音频直接能用，切换近乎零等待）
             if (_speaking)
             {
-                CutCurrentSentenceAtPosition(); // 按播放进度切掉已读部分，不回句首
+                double frac = GetCurrentFraction();
                 start = _currentSentence;
+                if (frac >= 0.97) { start++; _pendingSeekFrac = -1; }      // 句尾就当这句读完了
+                else if (frac is > 0.03 and < 0.97) _pendingSeekFrac = frac; // 句中：定位续播
+                else _pendingSeekFrac = -1;                                 // 句首：从头读
+                if (start >= _sentences.Count)
+                {
+                    // 已经在最后一句的末尾：视为读完，不再重读
+                    CancelPlayback();
+                    _bookmarkSentence = 0;
+                    SpeakEnded?.Invoke();
+                    return;
+                }
             }
             else
             {
@@ -180,45 +194,21 @@ public sealed class TtsService : IDisposable
         try { _player.PlaybackSession.PlaybackRate = _speed; } catch { }
     }
 
-    /// <summary>换声时：按播放进度把当前句切成"从当前位置开始"，而不是回句首。</summary>
-    private void CutCurrentSentenceAtPosition()
+    /// <summary>换声时：读取当前句的播放进度比例（0~1），读不到返回 -1。</summary>
+    private double GetCurrentFraction()
     {
-        if (_currentSentence >= _sentences.Count) return;
-        double frac = -1;
         try
         {
             var session = _player.PlaybackSession;
             if (_playerOpen && session.NaturalDuration.TotalMilliseconds > 0)
-                frac = session.Position.TotalMilliseconds / session.NaturalDuration.TotalMilliseconds;
+                return session.Position.TotalMilliseconds / session.NaturalDuration.TotalMilliseconds;
         }
         catch { }
-
-        if (frac > 0.03 && frac < 0.97)
-        {
-            string sentence = _sentences[_currentSentence];
-            int cut = (int)(frac * sentence.Length);
-            cut = SnapToPausePoint(sentence, cut);
-            if (cut > 0 && cut < sentence.Length)
-            {
-                _sentences[_currentSentence] = sentence[cut..];
-                // 这句被切过了，预合成的整句作废（否则换声会读出完整句，位置回跳）
-                foreach (var v in Voices)
-                    _prepared.Remove((v.Id, _currentSentence));
-            }
-        }
+        return -1;
     }
 
-    /// <summary>把估算的切割点回退到最近的标点/空格后（最多回退 12 字），避免从半个词中间读。</summary>
-    private static int SnapToPausePoint(string sentence, int cut)
-    {
-        for (int i = cut; i > Math.Max(0, cut - 12); i--)
-        {
-            char c = sentence[i - 1];
-            if (c is ' ' or '，' or ',' or '、' or '。' or '；' or ';' or '：' or ':' or '！' or '？' or '!' or '?')
-                return i;
-        }
-        return cut;
-    }
+    /// <summary>换声续播：PlayLoopAsync 打开第一句音频后要跳到的进度比例（-1 表示不跳转）。</summary>
+    private double _pendingSeekFrac = -1;
 
     /// <summary>释放当前音频（WinRT 播放器置空 Source 即释放文件句柄）。</summary>
     private void ClosePlayer()
@@ -305,6 +295,7 @@ public sealed class TtsService : IDisposable
 
     private async Task PlayLoopAsync(int start, CancellationToken ct)
     {
+        var myCts = _cts; // 本循环的身份标记：旧循环被取消后，不得碰新循环加载的音频
         try
         {
             var pending = new Dictionary<int, Task<string>>(); // 深度预取：高倍速下播放比合成快，一句提前量不够
@@ -318,6 +309,9 @@ public sealed class TtsService : IDisposable
                 for (int j = i + 1; j <= i + 2 && j < _sentences.Count; j++)
                     if (!pending.ContainsKey(j))
                         pending[j] = SynthesizeSentenceAsync(j, ct);
+
+                // 备选声音同步预取当前句和后面两句：朗读中切声音也能秒切换
+                PrefetchAltVoice(i, ct);
 
                 string file;
                 try
@@ -337,6 +331,28 @@ public sealed class TtsService : IDisposable
                 var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
                 TypedEventHandler<WinRTPlayer, object?> onEnded = (s, e) => tcs.TrySetResult(true);
                 _player.MediaEnded += onEnded;
+
+                // 换声续播：第一句音频打开后跳到和旧声音相同的进度位置
+                double seekFrac = i == start ? _pendingSeekFrac : -1;
+                _pendingSeekFrac = -1;
+                TypedEventHandler<WinRTPlayer, object?>? onOpened = null;
+                if (seekFrac > 0)
+                {
+                    onOpened = (s, e) =>
+                    {
+                        _player.MediaOpened -= onOpened;
+                        try
+                        {
+                            var dur = _player.PlaybackSession.NaturalDuration;
+                            if (dur.TotalMilliseconds > 0)
+                                _player.PlaybackSession.Position =
+                                    TimeSpan.FromMilliseconds(dur.TotalMilliseconds * seekFrac);
+                        }
+                        catch { }
+                    };
+                    _player.MediaOpened += onOpened;
+                }
+
                 try
                 {
                     await using var reg = ct.Register(() => tcs.TrySetCanceled());
@@ -351,8 +367,11 @@ public sealed class TtsService : IDisposable
                 finally
                 {
                     _player.MediaEnded -= onEnded;
-                    // 暂停时不释放：Resume 还要从原位置继续；其余情况释放文件句柄
-                    if (!_paused)
+                    if (onOpened != null) _player.MediaOpened -= onOpened;
+                    // 暂停时不释放：Resume 还要从原位置继续。
+                    // 令牌已换（切声音/重播）时也不释放：播放器里的音频已经是新循环
+                    // 刚加载的，旧循环若关掉它，新循环就永远等不到播完事件——全程无声
+                    if (!_paused && ReferenceEquals(_cts, myCts))
                         ClosePlayer();
                 }
             }
@@ -381,12 +400,33 @@ public sealed class TtsService : IDisposable
             && _prepared.Remove((SelectedVoiceId, index), out var ready))
         {
             try { return await ready; }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            catch (Exception ex)
             {
-                App.LogError(ex); // 预合成失败 → 现场重来
+                // 预合成失败/被取消（如切声音时的令牌切换）→ 现场重来。
+                // 注意连 OperationCanceledException 也要兜住：那是旧令牌的取消，
+                // 不是当前播放循环的取消，不能让它误杀整个播放
+                if (ex is not OperationCanceledException) App.LogError(ex);
             }
         }
         return await SynthesizeCoreAsync(_sentences[index], SelectedVoiceId, ct);
+    }
+
+    /// <summary>朗读中后台合成备选声音的当前句和后三句，存进 _prepared。
+    /// 用户中途切声音时直接有现成音频，不用等联网合成。
+    /// 注意：故意用预合成的取消令牌而不是播放令牌——切声音时播放令牌会被取消，
+    /// 若用播放令牌，备选声音的预取会在最需要它的那一刻被全部杀掉。</summary>
+    private void PrefetchAltVoice(int currentIndex, CancellationToken ct)
+    {
+        if (_preparedText != _lastText) return; // 预合成表对不上当前文本，存了也用不上
+        var alt = Voices.FirstOrDefault(v => v.Id != SelectedVoiceId);
+        if (alt == null) return;
+        var altCt = _preparedCts?.Token ?? ct;
+        for (int j = currentIndex; j <= currentIndex + 3 && j < _sentences.Count; j++)
+        {
+            if (_prepared.ContainsKey((alt.Id, j))) continue;
+            int idx = j; // 闭包捕获
+            _prepared[(alt.Id, idx)] = SynthesizeCoreAsync(_sentences[idx], alt.Id, altCt);
+        }
     }
 
     /// <summary>英文声音：整句无汉字时由她读（数字、单位原生英文念法）。

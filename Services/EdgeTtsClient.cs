@@ -18,17 +18,20 @@ public static class EdgeTtsClient
     private const string WssBase =
         "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1";
 
-    // ---- 连接预热池（容量 1：合成用掉一个就后台补一个）----
+    // ---- 连接预热池（容量 3：播放时主声音预取 + 备选声音预取是并行的，
+    // 只有 1 条预热连接的话，其余请求都得现场握手，来回多花几百毫秒）----
     private static readonly object WarmLock = new();
-    private static Task<ClientWebSocket>? _warmConnect;
+    private static readonly List<Task<ClientWebSocket>> _warmConnects = new();
+    private const int WarmPoolSize = 3;
 
-    /// <summary>后台预连一个 WebSocket，下次合成省掉 TCP+TLS 握手。</summary>
+    /// <summary>后台预连 WebSocket，正式合成时省掉 TCP+TLS 握手。不足 3 条就补齐。</summary>
     public static void WarmUp()
     {
         lock (WarmLock)
         {
-            if (_warmConnect == null || _warmConnect.IsCompleted)
-                _warmConnect = ConnectAsync(CancellationToken.None);
+            _warmConnects.RemoveAll(t => t.IsFaulted || t.IsCanceled); // 清掉失败的
+            while (_warmConnects.Count < WarmPoolSize)
+                _warmConnects.Add(ConnectAsync(CancellationToken.None));
         }
     }
 
@@ -55,23 +58,29 @@ public static class EdgeTtsClient
         }
     }
 
-    /// <summary>优先拿预热好的连接（还没连好就干等最多 3 秒），拿不到就现场连。</summary>
+    /// <summary>优先拿预热好的连接（已连好的优先，没连好的最多等 3 秒），拿不到就现场连。</summary>
     private static async Task<ClientWebSocket> TakeWarmOrConnectAsync(CancellationToken token)
     {
-        Task<ClientWebSocket>? warm;
-        lock (WarmLock) { warm = _warmConnect; _warmConnect = null; }
-
-        if (warm != null)
+        while (true)
         {
+            Task<ClientWebSocket>? warm;
+            lock (WarmLock)
+            {
+                _warmConnects.RemoveAll(t => t.IsFaulted || t.IsCanceled);
+                warm = _warmConnects.FirstOrDefault(t => t.Status == TaskStatus.RanToCompletion)
+                       ?? _warmConnects.FirstOrDefault(t => !t.IsCompleted);
+                if (warm != null) _warmConnects.Remove(warm);
+            }
+            if (warm == null) return await ConnectAsync(token);
+
             try
             {
                 var ws = await warm.WaitAsync(TimeSpan.FromSeconds(3), token);
                 if (ws.State == WebSocketState.Open) return ws;
-                ws.Dispose();
+                ws.Dispose(); // 连上了但被服务端关了（闲置超时），试下一条
             }
-            catch { /* 预热失败就现场连 */ }
+            catch { /* 这条预热失败，试下一条 */ }
         }
-        return await ConnectAsync(token);
     }
 
     private static async Task<ClientWebSocket> ConnectAsync(CancellationToken token)
