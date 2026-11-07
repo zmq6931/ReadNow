@@ -1,5 +1,6 @@
 using System.IO;
 using System.Runtime.InteropServices.WindowsRuntime;
+using System.Text.RegularExpressions;
 using Windows.Graphics.Imaging;
 using Windows.Media.Ocr;
 using Windows.Storage.Streams;
@@ -81,11 +82,32 @@ public static class OcrService
 
             var result = await engine.RecognizeAsync(bitmap);
             var text = result.Text?.Trim();
-            return string.IsNullOrWhiteSpace(text) ? null : text;
+            return string.IsNullOrWhiteSpace(text) ? null : CleanForSpeech(text);
         }
         catch
         {
             return null;
         }
+    }
+
+    /// <summary>
+    /// 清洗 OCR 结果，避免朗读一字一顿：
+    /// Windows OCR 常在每个汉字之间加空格、按视觉碎行加换行，
+    /// 在线语音（晓晓）会把这些空格读成停顿。粤语声音对此不敏感，普通话声音很明显。
+    /// </summary>
+    private static string CleanForSpeech(string text)
+    {
+        // 1) 汉字之间的空格/换行直接去掉（中文不需要词间空格）
+        text = Regex.Replace(text,
+            @"(?<=[一-鿿）】》！？；：，、。])\s+(?=[一-鿿（【《])", "");
+        // 2) 中文标点前的空格去掉
+        text = Regex.Replace(text, @"\s+(?=[，。！？；：、）】》])", "");
+        // 3) 汉字之间残留的换行也合并（句号等标点本身就是停顿，不需要换行帮忙）
+        text = Regex.Replace(text, @"(?<=[一-鿿])\s*\r?\n\s*(?=[一-鿿])", "");
+        // 4) 剩余的换行（英文/数字段落）转成空格
+        text = Regex.Replace(text, @"\s*\r?\n\s*", " ");
+        // 5) 压缩连续空格
+        text = Regex.Replace(text, @"[ \t]{2,}", " ");
+        return text.Trim();
     }
 }

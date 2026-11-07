@@ -45,9 +45,19 @@ public partial class PopupWindow : Window
         _tts.SpeakEnded += OnSpeakEnded;
         _tts.SentenceProgress += OnSentenceProgress;
 
+        // 弹窗一出现就预合成（两个声音的前两句）+ 预热连接：点播放/切声音近乎秒出声
+        _tts.PrepareText(text);
+
         // 功能开关复选框：与托盘菜单双向同步
         SyncTogglesFromHost();
         HostWindow.TogglesChanged += OnHostTogglesChanged;
+
+        // 声音下拉框：默认晓晓（标准普通话），选择自动记忆
+        _updatingVoice = true;
+        VoiceCombo.ItemsSource = _tts.Voices;
+        VoiceCombo.SelectedItem = _tts.Voices.FirstOrDefault(v => v.Id == _tts.SelectedVoiceId)
+                                  ?? _tts.Voices[0];
+        _updatingVoice = false;
 
         KeyDown += (_, e) =>
         {
@@ -63,6 +73,30 @@ public partial class PopupWindow : Window
 
     private static MainWindow HostWindow => (MainWindow)System.Windows.Application.Current.MainWindow;
     private bool _updatingToggles;
+    private bool _updatingVoice;
+
+    /// <summary>切换声音：写入记忆并立即生效（正在朗读则从当前句用新声音继续）。</summary>
+    private void VoiceCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_updatingVoice) return;
+        if (VoiceCombo.SelectedItem is not TtsService.VoiceChoice vc) return;
+
+        AppSettings.VoiceId = vc.Id;
+        AppSettings.Save();
+        _tts.SelectedVoiceId = vc.Id;
+
+        if (_tts.IsSpeaking)
+        {
+            _tts.Speak(_text, AppSettings.Speed); // 同文本正在播 → 从当前句继续（第一句已备好，零等待）
+            SetSpeakingUi(true);
+        }
+        else
+        {
+            _tts.PrepareText(_text); // 没在播：为新声音预合成，点播放秒出声
+        }
+        SpeakButton.Focus();
+        Keyboard.Focus(SpeakButton);
+    }
 
     private void Toggle_Changed(object sender, RoutedEventArgs e)
     {
@@ -116,6 +150,7 @@ public partial class PopupWindow : Window
         TranslationPanel.Visibility = Visibility.Collapsed;
         HideStatus();
         if (_tts.IsSpeaking || _tts.IsPaused) _tts.Stop(); // 新内容来了，彻底停掉旧的
+        _tts.PrepareText(text); // 新内容同样预合成
     }
 
     /// <summary>弹出并放到光标附近，强制拿到前台焦点（空格/回车即播放）。</summary>
@@ -192,6 +227,12 @@ public partial class PopupWindow : Window
     {
         if (_tts.IsSpeaking)
         {
+            if (_tts.IsBuffering)
+            {
+                // 正在联网合成语音：此时点击不能当"暂停"（会把合成取消掉，表现为"怎么点都没声音"）
+                ShowStatus("正在加载语音，请稍候…");
+                return;
+            }
             _tts.Pause(); // 精确暂停：音频停在原位置
             return;
         }
@@ -304,6 +345,11 @@ public partial class PopupWindow : Window
         SpeakButton.Content = speaking ? "⏸ 暂停" : "▶ 朗读";
         if (speaking)
         {
+            if (_tts.IsBuffering)
+            {
+                ShowStatus("正在加载语音…");
+                return;
+            }
             var resume = _tts.LastStartOffset > 0 ? "从上次位置继续 · " : "";
             var progress = _sentenceTotal > 1 ? $" · 第{_sentenceCurrent}/{_sentenceTotal}句" : "";
             ShowStatus($"{resume}正在朗读（{FormatSpeed(AppSettings.Speed)}）{progress}");

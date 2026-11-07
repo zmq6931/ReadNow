@@ -1,24 +1,26 @@
 using System.IO;
 using System.Text.RegularExpressions;
-using System.Windows.Media;
+using Windows.Foundation;
 using Windows.Media.SpeechSynthesis;
 using WinRTSynth = Windows.Media.SpeechSynthesis.SpeechSynthesizer;
+using WinRTPlayer = Windows.Media.Playback.MediaPlayer;
 
 namespace ReadNow.Services;
 
 /// <summary>
-/// 朗读服务 v2：基于 Windows 新一代语音引擎（OneCore 自然语音，如"晓晓"），离线可用。
-/// - 原生数字倍速（0.5x~6.0x）
-/// - 按句子队列播放，停止时记住句号，下次从该句继续
-/// - 支持声音列表选择（女声标注）
+/// 朗读服务 v5：Edge 在线神经语音（晓曼/晓晓，需联网）+ 本地自然语音包 + 离线兜底。
+/// - 弹窗出现时即预合成：当前声音前两句 + 另一个声音第一句，切声音零等待
+/// - 倍速用播放器变速（音调校正），拖滑块零延迟、不回句首
+/// - 播放中后台预取下一句，句间无等待
+/// - 精确暂停：音频停在原位置，一词不差地继续
 /// </summary>
 public sealed class TtsService : IDisposable
 {
     public const double MinSpeed = 0.5;
     public const double MaxSpeed = 4.0;
 
-    private readonly MediaPlayer _player = new();
-    private readonly WinRTSynth _synth = new();
+    private readonly WinRTPlayer _player = new(); // WinRT 播放器：变速带音调校正（不变尖）
+    private readonly WinRTSynth _synth = new(); // 离线兜底
     private readonly SemaphoreSlim _synthLock = new(1, 1);
     private CancellationTokenSource? _cts;
 
@@ -32,18 +34,30 @@ public sealed class TtsService : IDisposable
     private bool _paused;            // 精确暂停状态：音频停在原位置
     private bool _playerOpen;        // 播放器里是否已加载音频
     private double _speed = 1.0;
-    private VoiceInformation? _activeVoice;
 
-    // ---- 声音列表 ----
-    public sealed record VoiceChoice(string Id, string Display, bool IsFemale, string Language);
-    public IReadOnlyList<VoiceChoice> Voices { get; }
+    // ---- 弹窗预合成：key = (声音, 句索引)，两个声音都备 ----
+    private readonly Dictionary<(string Voice, int Index), Task<string>> _prepared = new();
+    private string? _preparedText;
+    private string? _preparedVoiceId;
+    private CancellationTokenSource? _preparedCts;
 
-    /// <summary>用户选定的声音 Id；null 表示自动（按文本语言优先选女声）。</summary>
-    public string? SelectedVoiceId { get; set; }
+    // ---- 声音列表（Edge 在线神经语音）----
+    public sealed record VoiceChoice(string Id, string Display, string Pitch);
+
+    public IReadOnlyList<VoiceChoice> Voices { get; } = new List<VoiceChoice>
+    {
+        new("zh-CN-XiaoxiaoNeural", "晓晓 · 普通话+英语（标准女声）", "+0Hz"),
+        new("zh-HK-HiuMaanNeural", "晓曼 · 粤语+英语（港味女声）", "-10Hz"),
+    };
+
+    /// <summary>用户选定的声音 Id（Edge 语音名）。</summary>
+    public string SelectedVoiceId { get; set; }
 
     public bool IsSpeaking => _speaking;
     /// <summary>精确暂停中：音频停在原位置，Resume 可一词不差地继续。</summary>
     public bool IsPaused => _paused;
+    /// <summary>正在联网合成语音（还没开始出声）。此时点"暂停"会把合成取消，UI 应拦截。</summary>
+    public bool IsBuffering => _speaking && !_playerOpen && !_paused;
     /// <summary>本次播放起点句索引（>0 表示续播），供 UI 提示。</summary>
     public int LastStartOffset { get; private set; }
     public bool HasBookmark => _bookmarkSentence > 0;
@@ -54,16 +68,65 @@ public sealed class TtsService : IDisposable
 
     public TtsService()
     {
-        Voices = WinRTSynth.AllVoices
-            .Select(v => new VoiceChoice(
-                v.Id,
-                v.DisplayName.Replace("Microsoft ", "").Replace(" Desktop", ""),
-                v.Gender == VoiceGender.Female,
-                v.Language))
-            .ToList();
+        // 读取用户记忆的声音；非法值回退默认（晓晓·标准普通话）
+        SelectedVoiceId = Voices.Any(v => v.Id == AppSettings.VoiceId)
+            ? AppSettings.VoiceId
+            : Voices[0].Id;
 
         Directory.CreateDirectory(_tempDir);
         CleanOldTempFiles();
+    }
+
+    /// <summary>
+    /// 弹窗展示文本时调用：预先合成当前声音的前两句 + 另一个声音的第一句。
+    /// 用户点播放 / 切声音时直接用现成的，近乎零等待。
+    /// </summary>
+    public void PrepareText(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text) || _speaking || _paused) return;
+        if (text == _lastText) return; // 续播场景无需预合成
+        if (text == _preparedText && _preparedVoiceId == SelectedVoiceId) return; // 已备好
+
+        if (text != _preparedText)
+        {
+            ClearPrepared();
+            EdgeTtsClient.WarmUp(); // 顺手把网络连接也热了
+            _preparedCts = new CancellationTokenSource();
+            _preparedText = text;
+        }
+        _preparedVoiceId = SelectedVoiceId;
+        var ct = _preparedCts!.Token;
+        var sentences = SplitSentences(text);
+
+        void Prepare(string voiceId, int index)
+        {
+            if (index < sentences.Count && !_prepared.ContainsKey((voiceId, index)))
+                _prepared[(voiceId, index)] = SynthesizeCoreAsync(sentences[index], voiceId, ct);
+        }
+
+        Prepare(SelectedVoiceId, 0);
+        Prepare(SelectedVoiceId, 1);
+        Prepare(SelectedVoiceId, 2);
+        // 备选声音排在主声音第一句之后，避免抢带宽拖慢正在用的声音
+        var alt = Voices.FirstOrDefault(v => v.Id != SelectedVoiceId);
+        if (alt != null && _prepared.TryGetValue((SelectedVoiceId, 0), out var firstSel))
+        {
+            _ = Task.Run(async () =>
+            {
+                try { await firstSel; } catch { }
+                if (_preparedText != text) return; // 文本已换新，别污染新的预合成
+                Prepare(alt.Id, 0);
+                Prepare(alt.Id, 1);
+            });
+        }
+    }
+
+    private void ClearPrepared()
+    {
+        try { _preparedCts?.Cancel(); } catch { }
+        _preparedCts = null;
+        _preparedText = null;
+        _prepared.Clear();
     }
 
     public void Speak(string text, double speed)
@@ -81,13 +144,18 @@ public sealed class TtsService : IDisposable
         }
         else
         {
-            // 同一文本：正在播 → 从当前句重读（用于变速/换声）；停了 → 从书签续播
-            start = _speaking
-                ? _currentSentence
-                : Math.Min(_bookmarkSentence, Math.Max(0, _sentences.Count - 1));
+            // 同一文本：正在播 → 从当前位置继续（用于换声）；停了 → 从书签续播
+            if (_speaking)
+            {
+                CutCurrentSentenceAtPosition(); // 按播放进度切掉已读部分，不回句首
+                start = _currentSentence;
+            }
+            else
+            {
+                start = Math.Min(_bookmarkSentence, Math.Max(0, _sentences.Count - 1));
+            }
         }
         LastStartOffset = start;
-        _activeVoice = ResolveVoice(text);
 
         CancelPlayback();
         _cts = new CancellationTokenSource();
@@ -97,37 +165,47 @@ public sealed class TtsService : IDisposable
     }
 
     /// <summary>
-    /// 朗读中变速：按播放进度估算当前读到的位置，从该处用新速度重新合成继续，
-    /// 而不是跳回句首。估算失败时退化为从当前句开头重读。
+    /// 朗读中变速：直接调播放器速度（带音调校正），零延迟、位置一丝不动。
     /// </summary>
     public void ChangeSpeedLive(double speed)
     {
         _speed = Math.Clamp(speed, MinSpeed, MaxSpeed);
-        if (!_speaking || _sentences.Count == 0) return;
+        ApplyPlaybackRate();
+    }
 
-        // 估算当前句内的进度（0~1）
+    /// <summary>把当前倍速应用到播放器（每句开始播放、恢复播放、变速时调用）。</summary>
+    private void ApplyPlaybackRate()
+    {
+        if (!_playerOpen) return;
+        try { _player.PlaybackSession.PlaybackRate = _speed; } catch { }
+    }
+
+    /// <summary>换声时：按播放进度把当前句切成"从当前位置开始"，而不是回句首。</summary>
+    private void CutCurrentSentenceAtPosition()
+    {
+        if (_currentSentence >= _sentences.Count) return;
         double frac = -1;
         try
         {
-            var dur = _player.NaturalDuration;
-            if (_playerOpen && dur.HasTimeSpan && dur.TimeSpan.TotalMilliseconds > 0)
-                frac = _player.Position.TotalMilliseconds / dur.TimeSpan.TotalMilliseconds;
+            var session = _player.PlaybackSession;
+            if (_playerOpen && session.NaturalDuration.TotalMilliseconds > 0)
+                frac = session.Position.TotalMilliseconds / session.NaturalDuration.TotalMilliseconds;
         }
         catch { }
 
-        if (frac > 0.03 && frac < 0.97 && _currentSentence < _sentences.Count)
+        if (frac > 0.03 && frac < 0.97)
         {
             string sentence = _sentences[_currentSentence];
             int cut = (int)(frac * sentence.Length);
             cut = SnapToPausePoint(sentence, cut);
             if (cut > 0 && cut < sentence.Length)
+            {
                 _sentences[_currentSentence] = sentence[cut..];
+                // 这句被切过了，预合成的整句作废（否则换声会读出完整句，位置回跳）
+                foreach (var v in Voices)
+                    _prepared.Remove((v.Id, _currentSentence));
+            }
         }
-
-        CancelPlayback();
-        _cts = new CancellationTokenSource();
-        _speaking = true;
-        _ = PlayLoopAsync(_currentSentence, _cts.Token);
     }
 
     /// <summary>把估算的切割点回退到最近的标点/空格后（最多回退 12 字），避免从半个词中间读。</summary>
@@ -142,6 +220,13 @@ public sealed class TtsService : IDisposable
         return cut;
     }
 
+    /// <summary>释放当前音频（WinRT 播放器置空 Source 即释放文件句柄）。</summary>
+    private void ClosePlayer()
+    {
+        try { _player.Source = null; } catch { }
+        _playerOpen = false;
+    }
+
     /// <summary>精确暂停：音频停在原位置，Resume() 从同一位置继续。</summary>
     public void Pause()
     {
@@ -153,7 +238,7 @@ public sealed class TtsService : IDisposable
         _speaking = false;
         if (_paused)
         {
-            try { if (_player.CanPause) _player.Pause(); } catch { }
+            try { _player.Pause(); } catch { }
         }
         SpeakEnded?.Invoke();
     }
@@ -169,7 +254,7 @@ public sealed class TtsService : IDisposable
         var ct = _cts.Token;
 
         // 当前句播完后，从下一句接着走
-        EventHandler? onEnded = null;
+        TypedEventHandler<WinRTPlayer, object?>? onEnded = null;
         onEnded = (s, e) =>
         {
             _player.MediaEnded -= onEnded;
@@ -178,7 +263,11 @@ public sealed class TtsService : IDisposable
                 _ = PlayLoopAsync(_currentSentence + 1, ct);
         };
         _player.MediaEnded += onEnded;
-        try { _player.Play(); }
+        try
+        {
+            ApplyPlaybackRate(); // 播放器速度要在 Play 前恢复（_playerOpen 仍为 true）
+            _player.Play();
+        }
         catch (Exception ex)
         {
             App.LogError(ex);
@@ -210,8 +299,7 @@ public sealed class TtsService : IDisposable
         _cts?.Cancel();
         _cts = null;
         _paused = false;
-        try { _player.Close(); } catch { } // Close 释放文件句柄
-        _playerOpen = false;
+        ClosePlayer(); // 释放文件句柄
         _speaking = false;
     }
 
@@ -219,35 +307,53 @@ public sealed class TtsService : IDisposable
     {
         try
         {
+            var pending = new Dictionary<int, Task<string>>(); // 深度预取：高倍速下播放比合成快，一句提前量不够
             for (int i = start; i < _sentences.Count; i++)
             {
                 ct.ThrowIfCancellationRequested();
                 _currentSentence = i;
                 SentenceProgress?.Invoke(i + 1, _sentences.Count);
 
-                var file = await SynthesizeSentenceAsync(i, ct);
+                // 不等当前句，先把后面两句也发出去合成（三句并行流水线）
+                for (int j = i + 1; j <= i + 2 && j < _sentences.Count; j++)
+                    if (!pending.ContainsKey(j))
+                        pending[j] = SynthesizeSentenceAsync(j, ct);
+
+                string file;
+                try
+                {
+                    file = pending.Remove(i, out var task)
+                        ? await task
+                        : await SynthesizeSentenceAsync(i, ct);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    // 预取失败（如断网后恢复）→ 现场重新合成一次（内部有离线兜底）
+                    App.LogError(ex);
+                    file = await SynthesizeCoreAsync(_sentences[i], SelectedVoiceId, ct);
+                }
                 ct.ThrowIfCancellationRequested();
 
                 var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-                void onEnded(object? s, EventArgs e) => tcs.TrySetResult(true);
+                TypedEventHandler<WinRTPlayer, object?> onEnded = (s, e) => tcs.TrySetResult(true);
                 _player.MediaEnded += onEnded;
                 try
                 {
                     await using var reg = ct.Register(() => tcs.TrySetCanceled());
-                    _player.Open(new Uri(file));
+                    _player.Source = Windows.Media.Core.MediaSource.CreateFromUri(new Uri(file));
                     _playerOpen = true;
+                    ApplyPlaybackRate();
                     _player.Play();
+                    SentenceProgress?.Invoke(i + 1, _sentences.Count); // 出声了，刷新"加载中"状态
+
                     await tcs.Task;
                 }
                 finally
                 {
                     _player.MediaEnded -= onEnded;
-                    // 暂停时不释放：Resume 还要从原位置继续；其余情况 Close 释放文件句柄
+                    // 暂停时不释放：Resume 还要从原位置继续；其余情况释放文件句柄
                     if (!_paused)
-                    {
-                        _player.Close();
-                        _playerOpen = false;
-                    }
+                        ClosePlayer();
                 }
             }
 
@@ -268,17 +374,86 @@ public sealed class TtsService : IDisposable
         }
     }
 
+    /// <summary>合成第 index 句：优先吃弹窗预合成的现成结果（两个声音都可能有）。</summary>
     private async Task<string> SynthesizeSentenceAsync(int index, CancellationToken ct)
+    {
+        if (_preparedText == _lastText
+            && _prepared.Remove((SelectedVoiceId, index), out var ready))
+        {
+            try { return await ready; }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                App.LogError(ex); // 预合成失败 → 现场重来
+            }
+        }
+        return await SynthesizeCoreAsync(_sentences[index], SelectedVoiceId, ct);
+    }
+
+    /// <summary>英文声音：整句无汉字时由她读（数字、单位原生英文念法）。
+    /// Aria +20Hz 高音调配方（用户试听后选定）。</summary>
+    private const string EnglishVoiceId = "en-US-AriaNeural";
+    private const string EnglishVoicePitch = "+20Hz";
+
+    /// <summary>合成一句：中英文自动分路（无汉字 → Aria 英文声音）；
+    /// 中文句有本地自然语音包就本地合成；否则走 Edge 在线；失败回退系统离线语音。
+    /// 注意：永远按 1 倍速合成，倍速由播放器变速实现。</summary>
+    private async Task<string> SynthesizeCoreAsync(string sentence, string voiceId, CancellationToken ct)
+    {
+        var voice = Voices.FirstOrDefault(v => v.Id == voiceId) ?? Voices[0];
+        bool hasCjk = sentence.Any(c => c >= 0x4E00 && c <= 0x9FFF);
+
+        // 中文句：本地自然语音（Win11 讲述人下载的 Natural 语音包）优先，零网络延迟
+        if (hasCjk)
+        {
+            string localName = voice.Id switch
+            {
+                "zh-CN-XiaoxiaoNeural" => "Xiaoxiao",
+                "zh-HK-HiuMaanNeural" => "HiuMaan",
+                _ => ""
+            };
+            if (localName.Length > 0)
+            {
+                var local = FindLocalNaturalVoice(localName);
+                if (local != null)
+                    return await SynthesizeOfflineAsync(sentence, ct, local);
+            }
+        }
+
+        string useVoice = hasCjk ? voice.Id : EnglishVoiceId;
+        string usePitch = hasCjk ? voice.Pitch : EnglishVoicePitch;
+        try
+        {
+            var mp3 = await EdgeTtsClient.SynthesizeAsync(sentence, useVoice, "+0%", usePitch, ct);
+            var file = Path.Combine(_tempDir, $"tts_{Guid.NewGuid():N}.mp3");
+            await File.WriteAllBytesAsync(file, mp3, ct);
+            return file;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            App.LogError(ex); // 记录原因，再走离线兜底
+            return await SynthesizeOfflineAsync(sentence, ct);
+        }
+    }
+
+    /// <summary>查找已安装的本地自然语音（如讲述人里下载的"晓晓 Natural"）。</summary>
+    private static VoiceInformation? FindLocalNaturalVoice(string namePart) =>
+        WinRTSynth.AllVoices.FirstOrDefault(v =>
+            v.DisplayName.Contains(namePart, StringComparison.OrdinalIgnoreCase) &&
+            (v.DisplayName.Contains("Natural", StringComparison.OrdinalIgnoreCase) ||
+             v.Id.Contains("Natural", StringComparison.OrdinalIgnoreCase)));
+
+    /// <summary>离线兜底：OneCore 系统语音（断网时用，音质一般但保证可用）。1 倍速合成。</summary>
+    private async Task<string> SynthesizeOfflineAsync(string sentence, CancellationToken ct, VoiceInformation? forceVoice = null)
     {
         await _synthLock.WaitAsync(ct);
         try
         {
-            if (_activeVoice != null && _synth.Voice.Id != _activeVoice.Id)
-                _synth.Voice = _activeVoice;
-            _synth.Options.SpeakingRate = _speed;
+            var voice = forceVoice ?? ResolveOfflineVoice(sentence);
+            if (voice != null && _synth.Voice.Id != voice.Id)
+                _synth.Voice = voice;
+            _synth.Options.SpeakingRate = 1.0; // 倍速统一由播放器实现
 
-            using var stream = await _synth.SynthesizeTextToStreamAsync(_sentences[index]);
-            // 每次合成用唯一文件名，避免与仍被播放器占用的旧文件冲突
+            using var stream = await _synth.SynthesizeTextToStreamAsync(sentence);
             var file = Path.Combine(_tempDir, $"tts_{Guid.NewGuid():N}.wav");
             await using (var fs = File.Create(file))
             {
@@ -292,16 +467,10 @@ public sealed class TtsService : IDisposable
         }
     }
 
-    /// <summary>声音决策：用户指定优先；否则按文本语言优先选女声。</summary>
-    private VoiceInformation? ResolveVoice(string text)
+    /// <summary>离线语音决策：按文本语言优先选女声。</summary>
+    private VoiceInformation? ResolveOfflineVoice(string text)
     {
         var all = WinRTSynth.AllVoices;
-        if (!string.IsNullOrEmpty(SelectedVoiceId))
-        {
-            var chosen = all.FirstOrDefault(v => v.Id == SelectedVoiceId);
-            if (chosen != null) return chosen;
-        }
-
         bool wantChinese = text.Any(c => c >= 0x4E00 && c <= 0x9FFF);
         string lang = wantChinese ? "zh" : "en";
         return all.FirstOrDefault(v => v.Language.StartsWith(lang) && v.Gender == VoiceGender.Female)
@@ -309,7 +478,8 @@ public sealed class TtsService : IDisposable
                ?? WinRTSynth.DefaultVoice;
     }
 
-    /// <summary>按句子切分长文（句读/bookmark 的粒度）。</summary>
+    /// <summary>按句子切分长文（句读/bookmark 的粒度）。超过约 48 字就按逗号再切：
+    /// 短句合成更快、首句出声更早，后续靠预取保持连贯。</summary>
     private static List<string> SplitSentences(string text)
     {
         var rough = Regex.Split(text, @"(?<=[。！？!?；;…\n])");
@@ -318,25 +488,27 @@ public sealed class TtsService : IDisposable
         {
             var p = part.Trim();
             if (p.Length == 0) continue;
-            if (p.Length <= 180)
+            if (p.Length <= 48)
             {
                 result.Add(p);
             }
             else
             {
-                // 超长句按逗号再切
-                var fine = Regex.Split(p, @"(?<=[，,、：:])");
+                // 超长句按逗号再切。注意保护数字千分位："23,000" 不能切成 "23"+"000"，
+                // 否则单独的数字段会被中文语音按中文数字念出来
+                var protectedText = Regex.Replace(p, @"(\d),(?=\d{3}\b)", "$1◆");
+                var fine = Regex.Split(protectedText, @"(?<=[，,、：:])");
                 var buf = "";
                 foreach (var f in fine)
                 {
-                    if ((buf + f).Length > 180 && buf.Length > 0)
+                    if ((buf + f).Length > 48 && buf.Length > 0)
                     {
-                        result.Add(buf.Trim());
+                        result.Add(buf.Trim().Replace("◆", ","));
                         buf = f;
                     }
                     else buf += f;
                 }
-                if (buf.Trim().Length > 0) result.Add(buf.Trim());
+                if (buf.Trim().Length > 0) result.Add(buf.Trim().Replace("◆", ","));
             }
         }
         if (result.Count == 0 && text.Trim().Length > 0) result.Add(text.Trim());
@@ -348,7 +520,7 @@ public sealed class TtsService : IDisposable
         try
         {
             // 唯一文件名会累积，启动时清掉旧的（被占用就跳过）
-            foreach (var f in Directory.GetFiles(_tempDir, "tts_*.wav"))
+            foreach (var f in Directory.GetFiles(_tempDir, "tts_*.*"))
             {
                 try { File.Delete(f); } catch { }
             }
@@ -358,8 +530,9 @@ public sealed class TtsService : IDisposable
 
     public void Dispose()
     {
+        ClearPrepared();
         CancelPlayback();
-        try { _player.Close(); } catch { }
+        try { _player.Dispose(); } catch { }
         _synth.Dispose();
     }
 }

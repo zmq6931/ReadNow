@@ -115,6 +115,15 @@
                         Background="Transparent" Foreground="#9CA3AF" BorderThickness="0"/>
             </WrapPanel>
 
+            <!-- 声音选择：默认晓曼（粤语+英语），选择自动记忆 -->
+            <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
+                <TextBlock Text="声音" VerticalAlignment="Center" FontSize="14"
+                           Foreground="#374151" Margin="0,0,8,0"/>
+                <ComboBox x:Name="VoiceCombo" Width="270" FontSize="14" VerticalAlignment="Center"
+                          DisplayMemberPath="Display" Cursor="Hand"
+                          SelectionChanged="VoiceCombo_SelectionChanged"/>
+            </StackPanel>
+
             <!-- 功能开关：与托盘菜单双向同步，自动记忆 -->
             <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
                 <CheckBox x:Name="SelectionToggle" Content="划词朗读（含 Ctrl+A）"
