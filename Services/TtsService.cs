@@ -461,18 +461,32 @@ public sealed class TtsService : IDisposable
 
         string useVoice = hasCjk ? voice.Id : EnglishVoiceId;
         string usePitch = hasCjk ? voice.Pitch : EnglishVoicePitch;
-        try
+
+        // 在线合成：失败时换一条连接重试一次（偶发的网络抖动/服务器无响应，
+        // 重试大多能成功）。两次都失败才回退离线语音——晓曼若直接回退会被
+        // 系统普通话声音接管，听起来就像"晓曼突然变成普通话"
+        for (int attempt = 0; attempt < 2; attempt++)
         {
-            var mp3 = await EdgeTtsClient.SynthesizeAsync(sentence, useVoice, "+0%", usePitch, ct);
-            var file = Path.Combine(_tempDir, $"tts_{Guid.NewGuid():N}.mp3");
-            await File.WriteAllBytesAsync(file, mp3, ct);
-            return file;
+            try
+            {
+                var mp3 = await EdgeTtsClient.SynthesizeAsync(sentence, useVoice, "+0%", usePitch, ct);
+                var file = Path.Combine(_tempDir, $"tts_{Guid.NewGuid():N}.mp3");
+                await File.WriteAllBytesAsync(file, mp3, ct);
+                return file;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                App.LogError(ex); // 记录原因，重试或走离线兜底
+            }
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            App.LogError(ex); // 记录原因，再走离线兜底
-            return await SynthesizeOfflineAsync(sentence, ct);
-        }
+        return await SynthesizeOfflineAsync(sentence, ct, preferredLang: LangOf(useVoice));
+    }
+
+    /// <summary>从 Edge 语音名提取语言标记（zh-HK-HiuMaanNeural → zh-HK），供离线兜底选同语言声音。</summary>
+    private static string LangOf(string edgeVoiceId)
+    {
+        var parts = edgeVoiceId.Split('-');
+        return parts.Length >= 2 ? parts[0] + "-" + parts[1] : edgeVoiceId;
     }
 
     /// <summary>查找已安装的本地自然语音（如讲述人里下载的"晓晓 Natural"）。</summary>
@@ -482,13 +496,15 @@ public sealed class TtsService : IDisposable
             (v.DisplayName.Contains("Natural", StringComparison.OrdinalIgnoreCase) ||
              v.Id.Contains("Natural", StringComparison.OrdinalIgnoreCase)));
 
-    /// <summary>离线兜底：OneCore 系统语音（断网时用，音质一般但保证可用）。1 倍速合成。</summary>
-    private async Task<string> SynthesizeOfflineAsync(string sentence, CancellationToken ct, VoiceInformation? forceVoice = null)
+    /// <summary>离线兜底：OneCore 系统语音（断网时用，音质一般但保证可用）。1 倍速合成。
+    /// preferredLang：优先选该语言的系统声音（如 zh-HK），避免晓曼失败时被普通话声音顶替。</summary>
+    private async Task<string> SynthesizeOfflineAsync(string sentence, CancellationToken ct,
+        VoiceInformation? forceVoice = null, string? preferredLang = null)
     {
         await _synthLock.WaitAsync(ct);
         try
         {
-            var voice = forceVoice ?? ResolveOfflineVoice(sentence);
+            var voice = forceVoice ?? ResolveOfflineVoice(sentence, preferredLang);
             if (voice != null && _synth.Voice.Id != voice.Id)
                 _synth.Voice = voice;
             _synth.Options.SpeakingRate = 1.0; // 倍速统一由播放器实现
@@ -507,10 +523,19 @@ public sealed class TtsService : IDisposable
         }
     }
 
-    /// <summary>离线语音决策：按文本语言优先选女声。</summary>
-    private VoiceInformation? ResolveOfflineVoice(string text)
+    /// <summary>离线语音决策：优先 preferredLang（如晓曼→zh-HK）的女声，其次按文本语言选女声。</summary>
+    private VoiceInformation? ResolveOfflineVoice(string text, string? preferredLang = null)
     {
         var all = WinRTSynth.AllVoices;
+        if (!string.IsNullOrEmpty(preferredLang))
+        {
+            var exact = all.FirstOrDefault(v =>
+                            v.Language.Equals(preferredLang, StringComparison.OrdinalIgnoreCase)
+                            && v.Gender == VoiceGender.Female)
+                        ?? all.FirstOrDefault(v =>
+                            v.Language.Equals(preferredLang, StringComparison.OrdinalIgnoreCase));
+            if (exact != null) return exact;
+        }
         bool wantChinese = text.Any(c => c >= 0x4E00 && c <= 0x9FFF);
         string lang = wantChinese ? "zh" : "en";
         return all.FirstOrDefault(v => v.Language.StartsWith(lang) && v.Gender == VoiceGender.Female)
