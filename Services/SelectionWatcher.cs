@@ -14,7 +14,9 @@ public sealed class SelectionWatcher : IDisposable
 {
     private const int MinDragPixels = 8;
     private const int MinTextLength = 1;
-    private const int MaxTextLength = 5000;
+    // 上限 20 万字：约一本书的篇幅，正常使用等于无限制；
+    // 保留一个 sanity cap 是防止误把几 MB 的日志/导出数据塞进弹窗卡死界面
+    private const int MaxTextLength = 200_000;
     private const int KeyCooldownMs = 800; // Ctrl+A 连发冷却
     private const int VK_A = 0x41;
 
@@ -123,9 +125,9 @@ public sealed class SelectionWatcher : IDisposable
             Thread.Sleep(150);
             Win32.SendCtrlC();
 
-            // 等待剪贴板变化（最多 600ms）
+            // 等待剪贴板变化（最多 2 秒：全选大文档时目标应用复制耗时较长）
             uint seqAfter = seqBefore;
-            for (int i = 0; i < 12; i++)
+            for (int i = 0; i < 40; i++)
             {
                 Thread.Sleep(50);
                 seqAfter = Win32.GetClipboardSequenceNumber();
