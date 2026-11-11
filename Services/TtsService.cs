@@ -1,4 +1,5 @@
 using System.IO;
+using System.Text;
 using System.Text.RegularExpressions;
 using Windows.Foundation;
 using Windows.Media.SpeechSynthesis;
@@ -544,9 +545,11 @@ public sealed class TtsService : IDisposable
     }
 
     /// <summary>按句子切分长文（句读/bookmark 的粒度）。超过约 48 字就按逗号再切：
-    /// 短句合成更快、首句出声更早，后续靠预取保持连贯。</summary>
+    /// 短句合成更快、首句出声更早，后续靠预取保持连贯。
+    /// 切分前先剥掉 Markdown 语法符号（# * 链接 表格竖线等），只读内容不读符号。</summary>
     private static List<string> SplitSentences(string text)
     {
+        text = CleanMarkdown(text);
         var rough = Regex.Split(text, @"(?<=[。！？!?；;…\n])");
         var result = new List<string>();
         foreach (var part in rough)
@@ -578,6 +581,40 @@ public sealed class TtsService : IDisposable
         }
         if (result.Count == 0 && text.Trim().Length > 0) result.Add(text.Trim());
         return result;
+    }
+
+    /// <summary>朗读前剥掉 Markdown 语法符号（划到 .md 文件/网页源码时常见）：
+    /// 标题 #、引用 >、列表符号、粗斜体 ** __、删除线 ~~、行内代码 `、
+    /// 链接/图片只留文字、表格竖线、分割线、代码块围栏。正文内容一律保留。</summary>
+    private static string CleanMarkdown(string text)
+    {
+        // 不含任何 Markdown 特征就原样返回，别白跑正则
+        if (!text.Contains('#') && !text.Contains('*') && !text.Contains('`')
+            && !text.Contains('[') && !text.Contains('|') && !text.Contains('>')
+            && !text.Contains("~~") && !text.Contains("__"))
+            return text;
+
+        var lines = text.Split('\n');
+        var sb = new StringBuilder(text.Length);
+        foreach (var raw in lines)
+        {
+            var line = raw;
+            if (Regex.IsMatch(line, @"^\s*```")) continue;                    // 代码块围栏
+            if (Regex.IsMatch(line, @"^\s*([-*_]\s*){3,}$")) continue;        // 分割线 --- *** ___
+            line = Regex.Replace(line, @"^\s{0,3}#{1,6}\s+", "");             // 标题 # ## ###
+            line = Regex.Replace(line, @"^\s{0,3}>\s?", "");                  // 引用 >
+            line = Regex.Replace(line, @"^(\s*)[-*+]\s+", "$1");              // 无序列表 - * +
+            line = Regex.Replace(line, @"!\[([^\]]*)\]\([^)]*\)", "$1");      // 图片 → alt 文字
+            line = Regex.Replace(line, @"\[([^\]]+)\]\([^)]*\)", "$1");       // 链接 → 显示文字
+            line = Regex.Replace(line, @"\*\*(.+?)\*\*", "$1");               // 粗体
+            line = Regex.Replace(line, @"__(.+?)__", "$1");                   // 粗体
+            line = Regex.Replace(line, @"~~(.+?)~~", "$1");                   // 删除线
+            line = Regex.Replace(line, @"\*(.+?)\*", "$1");                   // 斜体
+            line = Regex.Replace(line, @"`([^`]*)`", "$1");                   // 行内代码
+            line = line.Replace('|', ' ');                                    // 表格竖线
+            sb.AppendLine(line);
+        }
+        return sb.ToString();
     }
 
     private void CleanOldTempFiles()
